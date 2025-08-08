@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Claw Slice</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0b1020; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, "Apple Color Emoji", "Segoe UI Emoji"; }
+    #ui { position: fixed; left: 0; right: 0; top: 0; display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; color: #fff; user-select: none; }
+    #score { font-size: 24px; font-weight: 800; text-shadow: 0 2px 0 rgba(0,0,0,.4); }
+    #mult { font-size: 18px; opacity: .9; }
+    #hint { position: fixed; left: 50%; transform: translateX(-50%); bottom: 16px; color: #fff; background: rgba(255,255,255,.08); padding: 8px 12px; border-radius: 12px; font-size: 14px; }
+    #panel { position: fixed; top: 56px; left: 16px; right: 16px; display: flex; gap: 12px; flex-wrap: wrap; }
+    .btn { background: #1f2a60; color: #fff; border: 0; padding: 10px 14px; border-radius: 12px; box-shadow: 0 6px 0 #0d1433; cursor: pointer; font-weight: 700; }
+    .btn:active { transform: translateY(2px); box-shadow: 0 4px 0 #0d1433; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <div id="score">Score 0</div>
+    <div id="mult">Multiplier x1</div>
+  </div>
+  <div id="panel">
+    <button class="btn" id="restart">Restart</button>
+    <button class="btn" id="pause">Pause</button>
+  </div>
+  <div id="hint">Swipe with mouse or touch to slice fruit. Slice quickly to raise the multiplier.</div>
+  <canvas id="game"></canvas>
+  <script>
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  function resize() {
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    canvas.width = Math.floor(innerWidth * dpr);
+    canvas.height = Math.floor(innerHeight * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  addEventListener('resize', resize);
+  resize();
+
+  // Game state
+  let running = true;
+  let fruits = [];
+  let particles = [];
+  let claws = []; // recent swipe points
+  let lastSpawn = 0;
+  let spawnGap = 800; // ms
+  let gravity = 1200; // px per second squared
+  let score = 0;
+  let multiplier = 1;
+  let lastSliceTime = 0;
+  let comboWindow = 1400; // ms to keep combo chain
+  const scoreEl = document.getElementById('score');
+  const multEl = document.getElementById('mult');
+
+  const colors = [
+    '#ff5a5f', '#ffb703', '#8ecae6', '#90ee90', '#ffd166', '#c77dff', '#00f5d4', '#f72585'
+  ];
+
+  function rand(a, b) { return a + Math.random() * (b - a); }
+  function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+  function spawnFruitBurst() {
+    const n = Math.floor(rand(2, 5));
+    for (let i = 0; i < n; i++) {
+      const size = rand(26, 40);
+      const x = rand(60, innerWidth - 60);
+      const y = innerHeight + size + rand(0, 40);
+      const vx = rand(-220, 220);
+      const vy = rand(-900, -700);
+      fruits.push({ x, y, vx, vy, r: size, color: pick(colors), sliced: false, rot: rand(0, Math.PI * 2), vrot: rand(-4, 4) });
+    }
+  }
+
+  function emitJuice(x, y, color) {
+    for (let i = 0; i < 14; i++) {
+      particles.push({
+        x, y,
+        vx: rand(-200, 200),
+        vy: rand(-200, 50),
+        life: rand(0.4, 0.8),
+        age: 0,
+        color,
+        size: rand(4, 8)
+      });
+    }
+  }
+
+  function emitSliceStreak(x, y) {
+    for (let i = 0; i < 10; i++) {
+      particles.push({ x, y, vx: rand(-100, 100), vy: rand(-100, 100), life: 0.25, age: 0, color: '#ffffff', size: rand(2, 4) });
+    }
+  }
+
+  function lineCircleIntersect(x1, y1, x2, y2, cx, cy, r) {
+    const dx = x2 - x1, dy = y2 - y1;
+    const fx = x1 - cx, fy = y1 - cy;
+    const a = dx*dx + dy*dy;
+    const b = 2 * (fx*dx + fy*dy);
+    const c = fx*fx + fy*fy - r*r;
+    let t = -b / (2*a);
+    t = Math.max(0, Math.min(1, t));
+    const px = x1 + t * dx, py = y1 + t * dy;
+    const dist2 = (px - cx)**2 + (py - cy)**2;
+    return dist2 <= r*r;
+  }
+
+  // Input handling for desktop and touch
+  let swiping = false;
+  let lastPoint = null;
+  function addClawPoint(x, y) {
+    const now = performance.now();
+    claws.push({ x, y, t: now });
+    if (claws.length > 40) claws.shift();
+  }
+  canvas.addEventListener('mousedown', e => { swiping = true; lastPoint = { x: e.clientX, y: e.clientY }; addClawPoint(e.clientX, e.clientY); });
+  canvas.addEventListener('mousemove', e => {
+    if (!swiping) return;
+    const p = { x: e.clientX, y: e.clientY };
+    addClawPoint(p.x, p.y);
+    sliceAlong(lastPoint.x, lastPoint.y, p.x, p.y);
+    lastPoint = p;
+  });
+  canvas.addEventListener('mouseup', () => { swiping = false; lastPoint = null; });
+  canvas.addEventListener('mouseleave', () => { swiping = false; lastPoint = null; });
+
+  canvas.addEventListener('touchstart', e => {
+    const t = e.changedTouches[0];
+    swiping = true; lastPoint = { x: t.clientX, y: t.clientY }; addClawPoint(t.clientX, t.clientY);
+  }, { passive: true });
+  canvas.addEventListener('touchmove', e => {
+    const t = e.changedTouches[0];
+    if (!swiping) return;
+    const p = { x: t.clientX, y: t.clientY };
+    addClawPoint(p.x, p.y);
+    sliceAlong(lastPoint.x, lastPoint.y, p.x, p.y);
+    lastPoint = p;
+  }, { passive: true });
+  canvas.addEventListener('touchend', () => { swiping = false; lastPoint = null; }, { passive: true });
+
+  // Slice logic
+  function sliceAlong(x1, y1, x2, y2) {
+    let slicedAny = false;
+    for (const f of fruits) {
+      if (!f.sliced && lineCircleIntersect(x1, y1, x2, y2, f.x, f.y, f.r)) {
+        f.sliced = true;
+        emitJuice(f.x, f.y, f.color);
+        emitSliceStreak(f.x, f.y);
+        slicedAny = true;
+        const now = performance.now();
+        if (now - lastSliceTime <= comboWindow) {
+          multiplier = Math.min(multiplier + 1, 9);
+        } else {
+          multiplier = 1;
+        }
+        lastSliceTime = now;
+        score += 10 * multiplier;
+        bumpUI();
+      }
+    }
+    if (!slicedAny && performance.now() - lastSliceTime > comboWindow) {
+      multiplier = 1;
+    }
+  }
+
+  function bumpUI() {
+    scoreEl.textContent = `Score ${score}`;
+    multEl.textContent = `Multiplier x${multiplier}`;
+  }
+
+  // Update and draw
+  let last = performance.now();
+  function tick(now) {
+    const dt = Math.min(0.033, (now - last) / 1000);
+    last = now;
+    if (running) update(dt);
+    draw();
+    requestAnimationFrame(tick);
+  }
+
+  function update(dt) {
+    // spawn
+    if (performance.now() - lastSpawn > spawnGap) {
+      lastSpawn = performance.now();
+      spawnGap = rand(600, 1100);
+      spawnFruitBurst();
+    }
+
+    // fruits
+    for (const f of fruits) {
+      f.vy += gravity * dt;
+      f.x += f.vx * dt;
+      f.y += f.vy * dt;
+      f.rot += f.vrot * dt;
+    }
+    // remove off screen or sliced ones after falling
+    fruits = fruits.filter(f => !(f.y > innerHeight + 120) && !f.sliced);
+
+    // particles
+    for (const p of particles) {
+      p.age += dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vy += 600 * dt;
+    }
+    particles = particles.filter(p => p.age < p.life);
+
+    // fade out old claw points
+    const cutoff = performance.now() - 160;
+    claws = claws.filter(c => c.t >= cutoff);
+
+    // reset multiplier if combo window expired
+    if (performance.now() - lastSliceTime > comboWindow) {
+      multiplier = 1;
+      multEl.textContent = `Multiplier x${multiplier}`;
+    }
+  }
+
+  function drawRoundedFruit(f) {
+    const points = 10;
+    const jitter = 0.2;
+    ctx.save();
+    ctx.translate(f.x, f.y);
+    ctx.rotate(f.rot);
+    ctx.beginPath();
+    for (let i = 0; i <= points; i++) {
+      const t = (i / points) * Math.PI * 2;
+      const r = f.r * (1 + Math.sin(i * 1.3) * jitter * 0.3);
+      const px = Math.cos(t) * r;
+      const py = Math.sin(t) * r;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    const grd = ctx.createRadialGradient(0, 0, f.r * 0.2, -f.r * 0.3, -f.r * 0.3, f.r);
+    grd.addColorStop(0, '#ffffff33');
+    grd.addColorStop(1, f.color);
+    ctx.fillStyle = grd;
+    ctx.fill();
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = '#ffffff22';
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawBackground() {
+    // cartoony vertical stripes
+    const w = innerWidth, h = innerHeight;
+    const stripe = 120;
+    for (let x = 0; x < w + stripe; x += stripe) {
+      ctx.fillStyle = (Math.floor(x / stripe) % 2 === 0) ? '#0b1020' : '#0d1433';
+      ctx.fillRect(x, 0, stripe, h);
+    }
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, innerWidth, innerHeight);
+    drawBackground();
+
+    // draw fruits
+    for (const f of fruits) drawRoundedFruit(f);
+
+    // draw particles
+    for (const p of particles) {
+      const a = 1 - (p.age / p.life);
+      ctx.globalAlpha = Math.max(0, a);
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // draw claw trails as triple lines like claws
+    if (claws.length > 1) {
+      for (let k = -1; k <= 1; k++) {
+        const offset = k * 6;
+        ctx.lineWidth = 3;
+        ctx.lineCap = 'round';
+        const grd = ctx.createLinearGradient(0, 0, innerWidth, innerHeight);
+        grd.addColorStop(0, '#ffffff');
+        grd.addColorStop(1, '#88ccff');
+        ctx.strokeStyle = grd;
+        ctx.beginPath();
+        for (let i = 0; i < claws.length; i++) {
+          const c = claws[i];
+          const alpha = (i + 1) / claws.length;
+          ctx.globalAlpha = alpha * 0.9;
+          if (i === 0) ctx.moveTo(c.x, c.y + offset);
+          else ctx.lineTo(c.x, c.y + offset);
+        }
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    // UI pulse when high multiplier
+    if (multiplier >= 3) {
+      const t = Math.sin(performance.now() * 0.01) * 0.5 + 0.5;
+      multEl.style.transform = `scale(${1 + t * 0.06})`;
+      multEl.style.color = '#ffd166';
+    } else {
+      multEl.style.transform = 'scale(1)';
+      multEl.style.color = '#fff';
+    }
+  }
+
+  document.getElementById('restart').addEventListener('click', () => {
+    fruits = [];
+    particles = [];
+    claws = [];
+    score = 0;
+    multiplier = 1;
+    lastSliceTime = 0;
+    lastSpawn = 0;
+    bumpUI();
+  });
+
+  document.getElementById('pause').addEventListener('click', () => {
+    running = !running;
+    document.getElementById('pause').textContent = running ? 'Pause' : 'Resume';
+  });
+
+  requestAnimationFrame(tick);
+  </script>
+</body>
+</html>
